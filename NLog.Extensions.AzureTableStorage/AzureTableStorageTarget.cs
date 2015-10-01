@@ -4,76 +4,40 @@ using NLog.Targets;
 
 namespace NLog.Extensions.AzureTableStorage
 {
-    using System.Collections.Generic;
-    using System.Globalization;
+    using System.Collections.Concurrent;
+    using System.Configuration;
+    using System.Threading;
+    using System.Threading.Tasks;
+    using Internal;
     using Microsoft.WindowsAzure.Storage;
     using Microsoft.WindowsAzure.Storage.Table;
-
-    public interface IKeyStrategy
-    {
-        string Get(LogEventInfo logEvent);
-    }
-
-    public interface IPartitionKeyStrategy : IKeyStrategy
-    {
-    }
-
-    public interface IRowKeyStrategy : IKeyStrategy
-    {
-
-    }
-
-    public class ReverseTicksWithGuidRowKeyStrategy : IRowKeyStrategy
-    {
-        public string Get(LogEventInfo logEvent)
-        {
-            return string.Format("{0}__{1}", (DateTime.MaxValue.Ticks - DateTime.UtcNow.Ticks).ToString("d19"),
-                Guid.NewGuid());
-        }
-    }
-
-    public class LoggerNamePartitionKeyStrategy : IPartitionKeyStrategy
-    {
-        private readonly Func<LogEventInfo, string> formatFunc;
-
-        public LoggerNamePartitionKeyStrategy(string partitionKeyPrefix)
-        {
-            if (string.IsNullOrWhiteSpace(partitionKeyPrefix))
-            {
-                formatFunc = (e) => e.LoggerName;
-            }
-            else
-            {
-                formatFunc = (e) => partitionKeyPrefix + "." + e.LoggerName;
-            }
-        }
-
-        public string Get(LogEventInfo logEvent)
-        {
-            return formatFunc(logEvent);
-        }
-    }
 
 
     [Target("AzureTableStorage")]
     public class AzureTableStorageTarget : TargetWithLayout
     {
         private CloudTable _table;
-        
+
         [Required]
         public string TableName { get; set; }
 
+        [Required]
+        public string ConnectionString { get; set; }
+
         private IPartitionKeyStrategy _partitionKeyStrategy;
         private IRowKeyStrategy _rowKeyStrategy;
+
+        private ConcurrentQueue<DynamicTableEntity> _entities = new ConcurrentQueue<DynamicTableEntity>();
+        private string _lastPartitionKey = null;
+        private int _isProcessing;
 
         protected override void InitializeTarget()
         {
             base.InitializeTarget();
             ValidateParameters();
 
-            CloudStorageAccount storageAccount = CloudStorageAccount.DevelopmentStorageAccount;
-
-            _partitionKeyStrategy = new LoggerNamePartitionKeyStrategy("");
+            var storageAccount = GetCloudStorageAccount();
+            _partitionKeyStrategy = new ReverseTicksPartitionKeyStrategy();
             _rowKeyStrategy = new ReverseTicksWithGuidRowKeyStrategy();
 
             var tableClient = storageAccount.CreateCloudTableClient();
@@ -84,6 +48,35 @@ namespace NLog.Extensions.AzureTableStorage
         private void ValidateParameters()
         {
             IsNameValidForTableStorage(TableName);
+        }
+
+        private CloudStorageAccount GetCloudStorageAccount()
+        {
+            CloudStorageAccount account;
+            if (CloudStorageAccount.TryParse(ConnectionString, out account))
+            {
+                return account;
+            }
+
+            var setting = System.Configuration.ConfigurationManager.AppSettings[ConnectionString];
+            if (!string.IsNullOrEmpty(setting))
+            {
+                if (CloudStorageAccount.TryParse(setting, out account))
+                {
+                    return account;
+                }
+            }
+
+            var connectionStringSetting = System.Configuration.ConfigurationManager.ConnectionStrings[ConnectionString];
+            if (connectionStringSetting != null && !string.IsNullOrEmpty(connectionStringSetting.ConnectionString))
+            {
+                if (CloudStorageAccount.TryParse(connectionStringSetting.ConnectionString, out account))
+                {
+                    return account;
+                }
+            }
+
+            throw new ConfigurationErrorsException("Could not locate storage account connection string.");
         }
 
         private void IsNameValidForTableStorage(string tableName)
@@ -100,123 +93,54 @@ namespace NLog.Extensions.AzureTableStorage
 
         protected override void Write(LogEventInfo logEvent)
         {
-            //var layoutMessage = Layout.Render(logEvent);
+            string layoutMessage = Layout.Render(logEvent);
+            DynamicTableEntity entity = logEvent.CreateTableEntity(layoutMessage, _partitionKeyStrategy, _rowKeyStrategy);
+            _entities.Enqueue(entity);
 
-            var entry = logEvent.CreateTableEntity(_partitionKeyStrategy, _rowKeyStrategy);
-
-            var operation = new TableBatchOperation();
-            operation.Add(TableOperation.Insert(entry));
-            _table.ExecuteBatch(operation);
-        }
-    }
-
-
-    internal static class LogEventInfoExtensions
-    {
-        private const int MaxStringLength = 30000;
-        private const int MaxPayloadItems = 200;
-
-        public static DynamicTableEntity CreateTableEntity(this LogEventInfo logEventInfo,
-            IPartitionKeyStrategy partitionKeyStrategy, IRowKeyStrategy rowKeyStrategy)
-        {
-            var dictionary = new Dictionary<string, EntityProperty>();
-
-            dictionary.Add("LoggerName", new EntityProperty(logEventInfo.LoggerName));
-            dictionary.Add("LogTimeStamp", new EntityProperty(logEventInfo.TimeStamp));
-            dictionary.Add("Level", new EntityProperty(logEventInfo.Level.ToString()));
-            dictionary.Add("Message", new EntityProperty(logEventInfo.Message));
-            dictionary.Add("MessageWithLayout", new EntityProperty(logEventInfo.FormattedMessage));
-            dictionary.Add("SequenceID", new EntityProperty(logEventInfo.SequenceID));
-
-            AddProperties(logEventInfo, dictionary);
-            AddExceptionInfo(dictionary, "Exception_", logEventInfo.Exception, 0);
-
-            if (logEventInfo.StackTrace != null)
+            if (Interlocked.CompareExchange(ref _isProcessing, 1, 0) == 0)
             {
-                dictionary.Add("StackTrace", new EntityProperty(logEventInfo.StackTrace.ToString()));
+                ThreadPool.QueueUserWorkItem(ProcessQueue);
             }
-
-
-            var partitionKey = partitionKeyStrategy.Get(logEventInfo);
-            var rowKey = rowKeyStrategy.Get(logEventInfo);
-
-            return new DynamicTableEntity(partitionKey, rowKey, null, dictionary);
         }
 
-        private static void AddExceptionInfo(Dictionary<string, EntityProperty> dictionary, string prefix,
-            Exception exception, int level)
+        private void ProcessQueue(object state)
         {
-            if (exception == null)
+
+            do
             {
-                return;
-            }
+                DynamicTableEntity entity;
+                string partitionKey = string.Empty;
+                TableBatchOperation operation = new TableBatchOperation();
 
-            dictionary.Add(prefix + "_Type", new EntityProperty(exception.GetType().ToString()));
-            dictionary.Add(prefix + "_Message", new EntityProperty(exception.Message));
-
-            AddExceptionInfo(dictionary, prefix, exception.InnerException, level + 1);
-        }
-
-        private static void AddProperties(LogEventInfo logEventInfo, Dictionary<string, EntityProperty> dictionary)
-        {
-            foreach (var item in logEventInfo.Properties)
-            {
-                var value = item.Value;
-                if (value != null)
+                while (_entities.TryDequeue(out entity))
                 {
-                    EntityProperty property = null;
-                    var type = value.GetType();
-
-                    if (type == typeof (string))
+                    if (partitionKey != entity.PartitionKey)
                     {
-                        property = new EntityProperty((string) value);
-                    }
-                    else if (type == typeof (int))
-                    {
-                        property = new EntityProperty((int) value);
-                    }
-                    else if (type == typeof (long))
-                    {
-                        property = new EntityProperty((long) value);
-                    }
-                    else if (type == typeof (double))
-                    {
-                        property = new EntityProperty((double) value);
-                    }
-                    else if (type == typeof (Guid))
-                    {
-                        property = new EntityProperty((Guid) value);
-                    }
-                    else if (type == typeof (bool))
-                    {
-                        property = new EntityProperty((bool) value);
-                    }
-                    else if (type.IsEnum)
-                    {
-                        var typeCode = ((Enum) value).GetTypeCode();
-                        if (typeCode <= TypeCode.Int32)
+                        if (operation.Count != 0)
                         {
-                            property = new EntityProperty(Convert.ToInt32(value, CultureInfo.InvariantCulture));
+                            _table.ExecuteBatch(operation);
+                            operation = new TableBatchOperation();
                         }
-                        else
-                        {
-                            property = new EntityProperty(Convert.ToInt64(value, CultureInfo.InvariantCulture));
-                        }
-                    }
-                    else if (type == typeof (byte[]))
-                    {
-                        property = new EntityProperty((byte[]) value);
+
+                        partitionKey = entity.PartitionKey;
                     }
 
-                    //// TODO: add & review DateTimeOffset if it's supported
-
-                    if (property != null)
+                    operation.Add(TableOperation.Insert(entity));
+                    if (operation.Count == 100)
                     {
-                        dictionary.Add(string.Format(CultureInfo.InvariantCulture, "Property_{0}", item.Key), property);
+                        _table.ExecuteBatch(operation);
+                        operation = new TableBatchOperation();
                     }
                 }
-            }
-        }
 
+                if (operation.Count != 0)
+                {
+                    _table.ExecuteBatch(operation);
+                    operation = new TableBatchOperation();
+                }
+
+                Interlocked.Exchange(ref _isProcessing, 0);
+            } while (_entities.Count > 0 && Interlocked.CompareExchange(ref _isProcessing, 1, 0) == 0);
+        }
     }
 }
