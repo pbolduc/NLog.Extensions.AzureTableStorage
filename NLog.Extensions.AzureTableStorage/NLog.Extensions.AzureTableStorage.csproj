@@ -79,9 +79,7 @@
     <Compile Include="AzureStorageTableNameValidator.cs" />
     <Compile Include="AzureTableStorageTarget.cs" />
     <Compile Include="ConfigManager.cs" />
-    <Compile Include="LogEntity.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="TableStorageManager.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="app.config" />
